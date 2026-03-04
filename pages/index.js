@@ -14,7 +14,10 @@ function platformShareUrl(platformId, { text, pageUrl }) {
   const safeText = encodeURIComponent(text || '')
   const safeUrl = encodeURIComponent(pageUrl || '')
   if (platformId === 'x') return `https://x.com/intent/post?text=${safeText}`
-  if (platformId === 'facebook') return `https://www.facebook.com/sharer/sharer.php?u=${safeUrl}`
+  if (platformId === 'facebook') {
+    // Facebook mainly shares URLs; "quote" support varies by surface but doesn't hurt.
+    return `https://www.facebook.com/sharer/sharer.php?u=${safeUrl}&quote=${safeText}`
+  }
   if (platformId === 'instagram') return 'https://www.instagram.com/'
   if (platformId === 'tiktok') return 'https://www.tiktok.com/upload'
   return ''
@@ -71,11 +74,9 @@ export default function Home() {
     let popup = null
     try {
       const pageUrl = typeof window !== 'undefined' ? window.location.href : ''
-      const text = 'Harta e Re Administrative te Shqiperise'
+      const text = 'Ja si duket ndarja ime e re territoriale'
       const shareUrl = platformShareUrl(platformId, { text, pageUrl })
-      if (shareUrl && typeof window !== 'undefined') {
-        popup = window.open('', '_blank', 'noopener,noreferrer')
-      }
+      if (shareUrl && typeof window !== 'undefined') popup = window.open(shareUrl, '_blank', 'noopener,noreferrer')
 
       setSharing(true)
       const blob = await controls.captureScreenshot({ marginRatio: 0.1, background: '#ffffff' })
@@ -101,7 +102,6 @@ export default function Home() {
       a.remove()
       window.setTimeout(() => URL.revokeObjectURL(objectUrl), 30_000)
 
-      if (popup && !popup.closed) popup.location.href = shareUrl
       setShareStatus('')
     } catch (error) {
       if (popup && !popup.closed) popup.close()
