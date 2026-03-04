@@ -5,6 +5,7 @@ const AlbaniaMap = dynamic(() => import('../components/AlbaniaMap'), { ssr: fals
 
 export default function Home() {
   const [controls, setControls] = useState(null)
+  const [showLabels, setShowLabels] = useState(false)
 
   return (
     <div className="app-shell">
@@ -20,9 +21,18 @@ export default function Home() {
           >
             Reset
           </button>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={showLabels}
+              onChange={(e) => setShowLabels(e.target.checked)}
+              disabled={!controls?.loaded || !!controls?.error}
+            />
+            <span>Shfaq emrat e bashkive</span>
+          </label>
         </div>
       </header>
-      <AlbaniaMap onControls={setControls} />
+      <AlbaniaMap onControls={setControls} showMunicipalityLabels={showLabels} />
       <style jsx>{`
         .app-shell {
           background: #ffffff;
@@ -57,6 +67,10 @@ export default function Home() {
 
         .actions {
           margin-top: 10px;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          flex-wrap: wrap;
         }
 
         .btn {
@@ -78,6 +92,20 @@ export default function Home() {
 
         .btn:hover:not(:disabled) {
           background: #f8fafc;
+        }
+
+        .toggle {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 12px;
+          color: #0f172a;
+          user-select: none;
+        }
+
+        .toggle input {
+          width: 14px;
+          height: 14px;
         }
       `}</style>
     </div>
