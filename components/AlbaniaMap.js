@@ -187,7 +187,12 @@ export default function AlbaniaMap() {
         if (!mapContainer) return
 
         // Fallback view so something is visible even if fitBounds is delayed/cancelled in dev refresh.
-        map = L.map(mapContainer, { preferCanvas: true }).setView([41.34, 20.0], 7)
+        // Disable built-in UI controls; we render our own overlay UI.
+        map = L.map(mapContainer, {
+          preferCanvas: true,
+          zoomControl: false,
+          attributionControl: false
+        }).setView([41.34, 20.0], 7)
 
         const canvasRenderer = L.canvas({ padding: 0.5 })
 
@@ -428,19 +433,17 @@ export default function AlbaniaMap() {
       </aside>
       <style jsx>{`
         .map-wrapper {
-          position: relative;
-          width: 100%;
-          min-height: 82vh;
-          height: 82vh;
-          border: 1px solid #e5e7eb;
-          border-radius: 8px;
+          position: fixed;
+          inset: 0;
+          width: 100vw;
+          height: 100vh;
           overflow: hidden;
-          background: #e2e8f0;
+          background: #ffffff;
         }
 
         .map-root {
-          width: 100%;
-          height: 82vh;
+          width: 100vw;
+          height: 100vh;
           display: block;
           background: #ffffff;
         }
@@ -458,6 +461,13 @@ export default function AlbaniaMap() {
           line-height: 1.35;
           font-size: 12px;
           box-shadow: 0 10px 24px rgba(0, 0, 0, .08);
+          transition: transform 160ms ease, opacity 160ms ease;
+          opacity: 0.9;
+        }
+
+        .map-legend:hover {
+          opacity: 1;
+          transform: translateY(-1px);
         }
 
         .map-legend h2 {

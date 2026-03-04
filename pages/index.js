@@ -12,25 +12,34 @@ export default function Home() {
       <AlbaniaMap />
       <style jsx>{`
         .app-shell {
-          min-height: 100vh;
           background: #ffffff;
-          padding: 16px;
+          min-height: 100vh;
+          margin: 0;
+          padding: 0;
           box-sizing: border-box;
           font-family: "Trebuchet MS", "Gill Sans", "Gill Sans MT", Calibri, sans-serif;
         }
         .app-header {
-          max-width: 1100px;
-          margin: 0 auto 12px;
-          padding: 0 4px 8px;
+          position: fixed;
+          left: 12px;
+          top: 12px;
+          z-index: 1000;
+          padding: 12px 14px;
+          border-radius: 12px;
+          background: rgba(255, 255, 255, 0.92);
+          box-shadow: 0 10px 24px rgba(0, 0, 0, 0.10);
+          backdrop-filter: blur(8px);
+          max-width: min(560px, calc(100vw - 24px));
         }
         .app-header h1 {
           margin: 0 0 8px;
-          font-size: 30px;
+          font-size: 22px;
           color: #0f172a;
         }
         .app-header p {
           margin: 0;
           color: #334155;
+          font-size: 13px;
         }
       `}</style>
     </div>
