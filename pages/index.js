@@ -114,7 +114,7 @@ export default function Home() {
   return (
     <div className="app-shell">
       <header className="app-header">
-        <h1>Harta e Re Administrative te Shqiperise</h1>
+        <h1>Harta e Re Administrative e Shqiperise</h1>
         <p>Kliko njesite administrative per te ndryshuar kufijte e bashkive.</p>
         <div className="actions">
           <button
