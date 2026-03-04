@@ -208,7 +208,6 @@ export default function AlbaniaMap() {
         const adminAdjacency = new Map()
         const municipalityCodes = new Set()
         const municipalityAdjacency = new Map()
-        const adminAllowedMunicipalities = new Map()
 
         for (const feature of data.features) {
           const props = feature?.properties || {}
@@ -273,23 +272,6 @@ export default function AlbaniaMap() {
           return municipalityColor.get(String(municipalityCode)) || palette[0].hex
         }
 
-        // Build a stable "allowed municipalities" set per admin unit using only edges that separate
-        // exactly two municipalities (planar subdivision assumption). This avoids "random" cycles
-        // caused by edge-key collisions or topology quirks where an edge ends up mapped to 3+ munis.
-        for (const adminId of adminOriginalMunicipality.keys()) {
-          getOrCreateSet(adminAllowedMunicipalities, adminId).add(String(adminOriginalMunicipality.get(adminId)))
-        }
-        for (const edge of edgeOwners.values()) {
-          if (edge.admins.size < 2) continue
-          if (edge.munis.size !== 2) continue
-          const muniPair = Array.from(edge.munis).map(String)
-          for (const adminId of edge.admins) {
-            const setForAdmin = getOrCreateSet(adminAllowedMunicipalities, adminId)
-            setForAdmin.add(muniPair[0])
-            setForAdmin.add(muniPair[1])
-          }
-        }
-
         // Draw only borders between different municipalities (based on original CODE_MUNIC).
         // Avoid treating "unshared" edges as borders, since coordinate mismatches can make internal edges look unshared.
         const municipalityBorderLatLngs = []
@@ -334,15 +316,20 @@ export default function AlbaniaMap() {
               const currentMunicipality = String(adminAssignedMunicipality.get(adminId) || muniCode)
               const originalMunicipality = String(adminOriginalMunicipality.get(adminId) || muniCode)
 
-              // Only cycle within the stable, geographically-adjacent set for this admin unit.
-              // Do NOT inject the current municipality if it's not a true neighbor; that creates "random" cycles.
-              const allowedSet = new Set(adminAllowedMunicipalities.get(adminId) || [])
-              allowedSet.add(originalMunicipality)
+              // Recompute candidates on every click:
+              // home municipality + the CURRENT municipalities of adjacent admin units.
+              const candidates = new Set([originalMunicipality])
+              const neighbors = adminAdjacency.get(adminId) || new Set()
+              for (const neighborId of neighbors) {
+                const neighborAssigned = adminAssignedMunicipality.get(neighborId)
+                const neighborOriginal = adminOriginalMunicipality.get(neighborId)
+                const muni = String(neighborAssigned || neighborOriginal || '')
+                if (muni) candidates.add(muni)
+              }
 
-              if (allowedSet.size < 2) return
+              if (candidates.size < 2) return
 
-              // Cycle within the stable, geographically-adjacent municipality set.
-              const choices = Array.from(allowedSet).sort((a, b) => a.localeCompare(b))
+              const choices = Array.from(candidates).sort((a, b) => a.localeCompare(b))
               const effectiveCurrent = choices.includes(currentMunicipality) ? currentMunicipality : originalMunicipality
               const currentIndex = choices.indexOf(effectiveCurrent)
               const nextMunicipality = choices[(Math.max(0, currentIndex) + 1) % choices.length]
