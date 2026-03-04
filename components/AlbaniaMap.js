@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 
-// Snap coordinates so shared boundaries match. Keep this fairly tight so we don't create
-// false "adjacencies" that make cycling jump to unrelated municipalities.
-const EDGE_SNAP = 1e6
+// Snap coordinates so shared boundaries match even when polygons aren't numerically identical.
+// Too tight => internal borders look like "outer" borders (thick outlines around small units).
+// Too loose => false merges. This value is a pragmatic middle ground.
+const EDGE_SNAP = 1e5
 
 function coordKey(coord) {
   return `${Math.round(coord[0] * EDGE_SNAP)},${Math.round(coord[1] * EDGE_SNAP)}`
@@ -161,10 +162,84 @@ function adminKey(props) {
   return `${muni}:${admun}`
 }
 
-export default function AlbaniaMap() {
+function pointOnSegment(point, a, b, epsilon = 1e-10) {
+  const [px, py] = point
+  const [ax, ay] = a
+  const [bx, by] = b
+  const cross = (px - ax) * (by - ay) - (py - ay) * (bx - ax)
+  if (Math.abs(cross) > epsilon) return false
+  const dot = (px - ax) * (bx - ax) + (py - ay) * (by - ay)
+  if (dot < -epsilon) return false
+  const lenSq = (bx - ax) * (bx - ax) + (by - ay) * (by - ay)
+  if (dot - lenSq > epsilon) return false
+  return true
+}
+
+function pointInRing(point, ring) {
+  // Ray casting with boundary-inclusive check.
+  const [x, y] = point
+  let inside = false
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const a = ring[j]
+    const b = ring[i]
+    if (pointOnSegment(point, a, b)) return true
+    const xi = a[0]
+    const yi = a[1]
+    const xj = b[0]
+    const yj = b[1]
+    const intersect = (yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi + 0.0) + xi
+    if (intersect) inside = !inside
+  }
+  return inside
+}
+
+function pointInAnyPolygon(point, polygons) {
+  for (const poly of polygons) {
+    const { bbox, rings } = poly
+    if (point[0] < bbox[0] || point[0] > bbox[2] || point[1] < bbox[1] || point[1] > bbox[3]) continue
+    for (const ring of rings) {
+      if (pointInRing(point, ring)) return true
+    }
+  }
+  return false
+}
+
+function pointInPolygon(point, polygon) {
+  const { bbox, rings } = polygon
+  if (point[0] < bbox[0] || point[0] > bbox[2] || point[1] < bbox[1] || point[1] > bbox[3]) return false
+  for (const ring of rings) {
+    if (pointInRing(point, ring)) return true
+  }
+  return false
+}
+
+function interiorPointForPolygon(polygon) {
+  const { bbox, rings } = polygon
+  if (!bbox || !rings || rings.length === 0) return null
+  const ring = rings[0]
+  if (!Array.isArray(ring) || ring.length < 3) return null
+
+  // Try bbox center first.
+  const center = [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2]
+  if (pointInRing(center, ring)) return center
+
+  // Try a few edge midpoints (more likely to land inside for concave polygons than centroid).
+  const attempts = Math.min(12, ring.length - 1)
+  for (let i = 0; i < attempts; i += 1) {
+    const a = ring[i]
+    const b = ring[i + 1]
+    const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]
+    if (pointInRing(mid, ring)) return mid
+  }
+
+  return center
+}
+
+export default function AlbaniaMap({ onControls }) {
   const mapRef = useRef(null)
   const layerRef = useRef(null)
   const resetRef = useRef(null)
+  const recomputeBordersRef = useRef(null)
   const [loadError, setLoadError] = useState(null)
   const [loaded, setLoaded] = useState(false)
   const [featureCount, setFeatureCount] = useState(null)
@@ -209,6 +284,7 @@ export default function AlbaniaMap() {
         const adminRegistryById = new Map()
         const adminAssignedMunicipality = new Map() // adminId -> municipalityCode
         const adminOriginalMunicipality = new Map() // adminId -> municipalityCode
+        const adminGeometryIndex = new Map() // adminId -> { bbox: [minLon,minLat,maxLon,maxLat], rings: [ring,...] }
         const edgeOwners = new Map()
         const adminAdjacency = new Map()
         const municipalityCodes = new Set()
@@ -226,6 +302,25 @@ export default function AlbaniaMap() {
           getOrCreateSet(municipalityAdjacency, muniCode)
 
           const rings = getRings(feature.geometry)
+          if (!adminGeometryIndex.has(adminId)) {
+            let minLon = Infinity
+            let minLat = Infinity
+            let maxLon = -Infinity
+            let maxLat = -Infinity
+            for (const ring of rings) {
+              for (const pt of ring || []) {
+                const lon = pt[0]
+                const lat = pt[1]
+                if (lon < minLon) minLon = lon
+                if (lat < minLat) minLat = lat
+                if (lon > maxLon) maxLon = lon
+                if (lat > maxLat) maxLat = lat
+              }
+            }
+            if (Number.isFinite(minLon)) {
+              adminGeometryIndex.set(adminId, { bbox: [minLon, minLat, maxLon, maxLat], rings })
+            }
+          }
           for (const ring of rings) {
             if (!Array.isArray(ring) || ring.length < 4) continue
 
@@ -243,7 +338,8 @@ export default function AlbaniaMap() {
                   a,
                   b,
                   admins: new Set([adminId]),
-                  munis: new Set([muniCode])
+                  munis: new Set([muniCode]),
+                  exterior: null
                 })
               }
             }
@@ -277,28 +373,111 @@ export default function AlbaniaMap() {
           return municipalityColor.get(String(municipalityCode)) || palette[0].hex
         }
 
-        // Draw only borders between different municipalities (based on original CODE_MUNIC).
-        // Avoid treating "unshared" edges as borders, since coordinate mismatches can make internal edges look unshared.
-        const municipalityBorderLatLngs = []
+        // Precompute which "unshared" edges are truly exterior (not inside any other admin polygon).
+        // This avoids thick outlines around enclaves where boundaries fail to stitch numerically.
+        const polygonList = Array.from(adminGeometryIndex.entries()).map(([adminId, geom]) => ({
+          adminId,
+          bbox: geom.bbox,
+          rings: geom.rings
+        }))
+
         for (const edge of edgeOwners.values()) {
-          if (edge.munis.size < 2) continue
-          municipalityBorderLatLngs.push([
-            [edge.a[1], edge.a[0]],
-            [edge.b[1], edge.b[0]]
-          ])
+          if (edge.admins.size !== 1) continue
+          const [ownerId] = Array.from(edge.admins)
+          const owner = adminGeometryIndex.get(ownerId)
+          if (!owner) {
+            edge.exterior = true
+            continue
+          }
+          const mid = [(edge.a[0] + edge.b[0]) / 2, (edge.a[1] + edge.b[1]) / 2]
+          const candidates = []
+          for (const poly of polygonList) {
+            if (poly.adminId === ownerId) continue
+            // Quick bbox reject.
+            if (mid[0] < poly.bbox[0] || mid[0] > poly.bbox[2] || mid[1] < poly.bbox[1] || mid[1] > poly.bbox[3]) {
+              continue
+            }
+            candidates.push(poly)
+          }
+          // If midpoint is inside any other polygon, this edge is not exterior.
+          edge.exterior = !pointInAnyPolygon(mid, candidates)
+        }
+
+        const computeCurrentMunicipalityBorderLatLngs = () => {
+          // Outer outline + borders between different CURRENT municipalities.
+          const borderLatLngs = []
+          for (const edge of edgeOwners.values()) {
+            const admins = Array.from(edge.admins)
+
+            // Outer boundary edge.
+            if (admins.length === 1) {
+              if (!edge.exterior) continue
+              borderLatLngs.push([
+                [edge.a[1], edge.a[0]],
+                [edge.b[1], edge.b[0]]
+              ])
+              continue
+            }
+
+            // Interior edge: only consider clean edges shared by exactly 2 admin units.
+            // If 3+ appear, it's likely an edge-key collision and drawing it causes stray borders.
+            if (admins.length !== 2) continue
+
+            // Draw if the two admin units currently belong to different municipalities.
+            const muniSet = new Set()
+            for (const adminId of admins) {
+              const assigned = adminAssignedMunicipality.get(adminId)
+              const original = adminOriginalMunicipality.get(adminId)
+              const muni = String(assigned || original || '')
+              if (muni) muniSet.add(muni)
+              if (muniSet.size >= 2) break
+            }
+
+            if (muniSet.size >= 2) {
+              borderLatLngs.push([
+                [edge.a[1], edge.a[0]],
+                [edge.b[1], edge.b[0]]
+              ])
+            }
+          }
+
+          return borderLatLngs
         }
 
         for (const edge of edgeOwners.values()) {
-          const admins = Array.from(edge.admins)
-          if (admins.length >= 2) {
-            for (let i = 0; i < admins.length; i += 1) {
-              for (let j = i + 1; j < admins.length; j += 1) {
-                const aAdmin = admins[i]
-                const bAdmin = admins[j]
-                getOrCreateSet(adminAdjacency, aAdmin).add(bAdmin)
-                getOrCreateSet(adminAdjacency, bAdmin).add(aAdmin)
-              }
+          // Only treat clean shared edges as adjacency. If 3+ admin units appear on a single edge key,
+          // that's almost always a snap/topology collision and creates bogus "neighbors".
+          if (edge.admins.size !== 2) continue
+          const [aAdmin, bAdmin] = Array.from(edge.admins)
+          getOrCreateSet(adminAdjacency, aAdmin).add(bAdmin)
+          getOrCreateSet(adminAdjacency, bAdmin).add(aAdmin)
+        }
+
+        // Enclave handling: if an admin unit is fully contained inside another, add adjacency so it can
+        // cycle into the containing unit's municipality assignment.
+        for (const inner of polygonList) {
+          const probe = interiorPointForPolygon(inner)
+          if (!probe) continue
+
+          let bestContainer = null
+          let bestArea = Infinity
+          for (const outer of polygonList) {
+            if (outer.adminId === inner.adminId) continue
+            if (probe[0] < outer.bbox[0] || probe[0] > outer.bbox[2] || probe[1] < outer.bbox[1] || probe[1] > outer.bbox[3]) {
+              continue
             }
+            if (!pointInPolygon(probe, outer)) continue
+
+            const area = (outer.bbox[2] - outer.bbox[0]) * (outer.bbox[3] - outer.bbox[1])
+            if (area < bestArea) {
+              bestArea = area
+              bestContainer = outer.adminId
+            }
+          }
+
+          if (bestContainer) {
+            getOrCreateSet(adminAdjacency, inner.adminId).add(bestContainer)
+            getOrCreateSet(adminAdjacency, bestContainer).add(inner.adminId)
           }
         }
 
@@ -341,6 +520,7 @@ export default function AlbaniaMap() {
 
               adminAssignedMunicipality.set(adminId, nextMunicipality)
               layerItem.setStyle(buildAdminStyle(getMunicipalityColor(nextMunicipality)))
+              recomputeBordersRef.current?.()
             })
           }
         })
@@ -348,13 +528,20 @@ export default function AlbaniaMap() {
         if (cancelled) return
         adminLayer.addTo(map)
 
-        const municipalityBorderLayer = L.polyline(municipalityBorderLatLngs, {
+        const municipalityBorderLayer = L.polyline(computeCurrentMunicipalityBorderLatLngs(), {
           ...buildMunicipalityBorderStyle(),
           renderer: canvasRenderer
         })
         municipalityBorderLayer.addTo(map)
 
         layerRef.current = adminLayer
+
+        const recomputeBorders = () => {
+          const next = computeCurrentMunicipalityBorderLatLngs()
+          municipalityBorderLayer.setLatLngs(next)
+          if (typeof municipalityBorderLayer.redraw === 'function') municipalityBorderLayer.redraw()
+        }
+        recomputeBordersRef.current = recomputeBorders
 
         resetRef.current = () => {
           adminAssignedMunicipality.clear()
@@ -367,6 +554,16 @@ export default function AlbaniaMap() {
             const originalMunicipality = String(adminOriginalMunicipality.get(adminId) || fromGeoJson)
             adminAssignedMunicipality.set(adminId, originalMunicipality)
             layerItem.setStyle(buildAdminStyle(getMunicipalityColor(originalMunicipality)))
+          })
+          recomputeBorders()
+        }
+
+        if (typeof onControls === 'function') {
+          onControls({
+            reset: () => resetRef.current?.(),
+            recomputeBorders: () => recomputeBordersRef.current?.(),
+            loaded: true,
+            error: null
           })
         }
 
@@ -391,8 +588,17 @@ export default function AlbaniaMap() {
         setLoaded(true)
       } catch (error) {
         if (!cancelled) {
-          setLoadError(`Failed to load map data: ${error?.message || 'Unknown error'}`)
+          const message = `Failed to load map data: ${error?.message || 'Unknown error'}`
+          setLoadError(message)
           setLoaded(true)
+          if (typeof onControls === 'function') {
+            onControls({
+              reset: () => {},
+              recomputeBorders: () => {},
+              loaded: true,
+              error: message
+            })
+          }
           if (map && map.remove) map.remove()
         }
       }
@@ -408,6 +614,8 @@ export default function AlbaniaMap() {
       }
       layerRef.current?.remove()
       resetRef.current = null
+      recomputeBordersRef.current = null
+      if (typeof onControls === 'function') onControls(null)
       if (map) map.remove()
     }
   }, [])
@@ -415,22 +623,6 @@ export default function AlbaniaMap() {
   return (
     <div className="map-wrapper">
       <div ref={mapRef} className="map-root" />
-      <aside className="map-legend">
-        <h2>Albania Admin Units</h2>
-        <p>Each municipality has a unique color (61-color palette). Admin units start colored by their municipality.</p>
-        <p>Click an admin unit on a municipality border to cycle it into adjacent municipalities (based on current neighbors).</p>
-        <button
-          className="reset"
-          type="button"
-          onClick={() => resetRef.current?.()}
-          disabled={!loaded || !!loadError}
-        >
-          Reset
-        </button>
-        {featureCount !== null && <p>Loaded features: {featureCount}</p>}
-        {loadError && <p className="error">{loadError}</p>}
-        {!loaded && !loadError && <p>Loading Albania administrative map…</p>}
-      </aside>
       <style jsx>{`
         .map-wrapper {
           position: fixed;
@@ -446,69 +638,6 @@ export default function AlbaniaMap() {
           height: 100vh;
           display: block;
           background: #ffffff;
-        }
-
-        .map-legend {
-          position: absolute;
-          top: 12px;
-          right: 12px;
-          background: rgba(255, 255, 255, 0.95);
-          padding: 10px 12px;
-          border-radius: 10px;
-          z-index: 800;
-          max-width: 360px;
-          font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-          line-height: 1.35;
-          font-size: 12px;
-          box-shadow: 0 10px 24px rgba(0, 0, 0, .08);
-          transition: transform 160ms ease, opacity 160ms ease;
-          opacity: 0.9;
-        }
-
-        .map-legend:hover {
-          opacity: 1;
-          transform: translateY(-1px);
-        }
-
-        .map-legend h2 {
-          margin: 0 0 6px;
-          font-size: 14px;
-        }
-
-        .map-legend p {
-          margin: 0 0 6px;
-          color: #334155;
-        }
-
-        .map-legend p:last-child {
-          margin-bottom: 0;
-        }
-
-        .reset {
-          appearance: none;
-          border: 1px solid #cbd5e1;
-          background: #ffffff;
-          color: #0f172a;
-          font-weight: 700;
-          font-size: 12px;
-          padding: 6px 10px;
-          border-radius: 10px;
-          cursor: pointer;
-          margin: 2px 0 8px;
-        }
-
-        .reset:disabled {
-          opacity: 0.5;
-          cursor: not-allowed;
-        }
-
-        .reset:hover:not(:disabled) {
-          background: #f8fafc;
-        }
-
-        .error {
-          color: #991b1b;
-          font-weight: 600;
         }
       `}</style>
     </div>

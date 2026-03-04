@@ -1,15 +1,28 @@
 import dynamic from 'next/dynamic'
+import { useState } from 'react'
 
 const AlbaniaMap = dynamic(() => import('../components/AlbaniaMap'), { ssr: false })
 
 export default function Home() {
+  const [controls, setControls] = useState(null)
+
   return (
     <div className="app-shell">
       <header className="app-header">
         <h1>Krijo Harten e re Administrative te Shqiperise</h1>
         <p>Kliko njesite administrative per te ndryshuar kufijte e bashkive.</p>
+        <div className="actions">
+          <button
+            type="button"
+            className="btn"
+            onClick={() => controls?.reset?.()}
+            disabled={!controls?.loaded || !!controls?.error}
+          >
+            Reset
+          </button>
+        </div>
       </header>
-      <AlbaniaMap />
+      <AlbaniaMap onControls={setControls} />
       <style jsx>{`
         .app-shell {
           background: #ffffff;
@@ -40,6 +53,31 @@ export default function Home() {
           margin: 0;
           color: #334155;
           font-size: 13px;
+        }
+
+        .actions {
+          margin-top: 10px;
+        }
+
+        .btn {
+          appearance: none;
+          border: 1px solid #cbd5e1;
+          background: #ffffff;
+          color: #0f172a;
+          font-weight: 700;
+          font-size: 12px;
+          padding: 7px 10px;
+          border-radius: 10px;
+          cursor: pointer;
+        }
+
+        .btn:disabled {
+          opacity: 0.5;
+          cursor: not-allowed;
+        }
+
+        .btn:hover:not(:disabled) {
+          background: #f8fafc;
         }
       `}</style>
     </div>
