@@ -145,10 +145,29 @@ function buildCountryOutlineStyle() {
     color: '#0b1220',
     weight: 4,
     opacity: 0.95,
-    lineCap: 'butt',
-    lineJoin: 'miter',
+    lineCap: 'round',
+    lineJoin: 'round',
     interactive: false
   }
+}
+
+function getReadableTextColor(backgroundHex) {
+  const hex = String(backgroundHex || '').replace('#', '').trim()
+  if (hex.length !== 3 && hex.length !== 6) return '#0b1220'
+
+  const full = hex.length === 3 ? hex.split('').map((c) => c + c).join('') : hex
+  const r = parseInt(full.slice(0, 2), 16)
+  const g = parseInt(full.slice(2, 4), 16)
+  const b = parseInt(full.slice(4, 6), 16)
+  if (![r, g, b].every(Number.isFinite)) return '#0b1220'
+
+  // Relative luminance (sRGB).
+  const srgb = [r, g, b].map((v) => {
+    const c = v / 255
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4
+  })
+  const luminance = 0.2126 * srgb[0] + 0.7152 * srgb[1] + 0.0722 * srgb[2]
+  return luminance < 0.5 ? '#ffffff' : '#0b1220'
 }
 
 function mapDataErrors(data) {
@@ -201,6 +220,67 @@ function pointInRing(point, ring) {
     if (intersect) inside = !inside
   }
   return inside
+}
+
+function ringSignedAreaAndCentroid(ring) {
+  if (!Array.isArray(ring)) return { areaSigned: 0, centroid: null }
+  let n = ring.length
+  if (n < 3) return { areaSigned: 0, centroid: null }
+
+  const first = ring[0]
+  const last = ring[n - 1]
+  if (first && last && first[0] === last[0] && first[1] === last[1]) n -= 1
+  if (n < 3) return { areaSigned: 0, centroid: null }
+
+  let sumCross = 0
+  let sumCx = 0
+  let sumCy = 0
+
+  for (let i = 0; i < n; i += 1) {
+    const a = ring[i]
+    const b = ring[(i + 1) % n]
+    if (!a || !b) continue
+    const ax = a[0]
+    const ay = a[1]
+    const bx = b[0]
+    const by = b[1]
+    const cross = ax * by - bx * ay
+    sumCross += cross
+    sumCx += (ax + bx) * cross
+    sumCy += (ay + by) * cross
+  }
+
+  const areaSigned = sumCross / 2
+  if (!Number.isFinite(areaSigned) || areaSigned === 0) return { areaSigned: 0, centroid: null }
+  const cx = sumCx / (6 * areaSigned)
+  const cy = sumCy / (6 * areaSigned)
+  if (!Number.isFinite(cx) || !Number.isFinite(cy)) return { areaSigned: 0, centroid: null }
+  return { areaSigned, centroid: [cx, cy] }
+}
+
+function polygonAreaAbsAndCentroid({ bbox, rings } = {}) {
+  if (!Array.isArray(rings) || rings.length === 0) {
+    if (bbox) return { areaAbs: 0, centroid: [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2] }
+    return { areaAbs: 0, centroid: null }
+  }
+
+  let sumA = 0
+  let sumX = 0
+  let sumY = 0
+
+  for (const ring of rings) {
+    const { areaSigned, centroid } = ringSignedAreaAndCentroid(ring)
+    if (!centroid) continue
+    const a = Math.abs(areaSigned)
+    if (!Number.isFinite(a) || a <= 0) continue
+    sumA += a
+    sumX += centroid[0] * a
+    sumY += centroid[1] * a
+  }
+
+  if (sumA > 0) return { areaAbs: sumA, centroid: [sumX / sumA, sumY / sumA] }
+  if (bbox) return { areaAbs: 0, centroid: [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2] }
+  return { areaAbs: 0, centroid: null }
 }
 
 function pointInAnyPolygon(point, polygons) {
@@ -291,7 +371,16 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
           attributionControl: false
         }).setView([41.34, 20.0], 7)
 
+        const outlinePaneName = 'country-outline'
+        if (!map.getPane(outlinePaneName)) map.createPane(outlinePaneName)
+        const outlinePane = map.getPane(outlinePaneName)
+        if (outlinePane) {
+          outlinePane.style.zIndex = '450'
+          outlinePane.style.pointerEvents = 'none'
+        }
+
         const canvasRenderer = L.canvas({ padding: 0.5 })
+        const outlineRenderer = L.svg({ pane: outlinePaneName })
 
         const response = await fetch('/adm_units_munis_with_polygons.geojson')
         if (!response.ok) throw new Error(`GET ${response.status}`)
@@ -345,7 +434,9 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
               }
             }
             if (Number.isFinite(minLon)) {
-              adminGeometryIndex.set(adminId, { bbox: [minLon, minLat, maxLon, maxLat], rings })
+              const bbox = [minLon, minLat, maxLon, maxLat]
+              const { areaAbs, centroid } = polygonAreaAbsAndCentroid({ bbox, rings })
+              adminGeometryIndex.set(adminId, { bbox, rings, areaAbs, centroid })
             }
           }
           for (const ring of rings) {
@@ -477,10 +568,9 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
           }
         }
 
-        // Country outline: draw only edges that are truly exterior to the union of all admin polygons.
-        // We restrict to edges owned by a single admin polygon, then test points on both sides of the edge:
-        // - National border: one side inside Albania, the other outside all polygons.
-        // - Enclave boundary: both sides inside some polygon (enclave + container), so we do NOT outline it.
+        // Country outline (legacy check): draw only edges that are truly exterior to the union of all admin polygons.
+        // This is more expensive and can be too strict for some datasets; the primary outline path below does
+        // NOT rely on this check and instead derives the outline as the largest closed loop of unshared edges.
         const isExteriorEdge = (edge) => {
           const a = edge.a
           const b = edge.b
@@ -528,7 +618,6 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
 
         for (const edge of edgeOwners.values()) {
           if (edge.admins.size !== 1) continue
-          if (!isExteriorEdge(edge)) continue
           const a = snapPt(edge.a)
           const b = snapPt(edge.b)
           const aKey = coordKeyFromSnapped(a)
@@ -608,7 +697,7 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
           }
         }
 
-        const countryOutlineLatLngs = []
+        const outlineChains = []
         for (const { aKey, bKey } of outlineEdgeList) {
           const startEk = edgeKeyFromKeys(aKey, bKey)
           if (visitedOutlineEdges.has(startEk)) continue
@@ -616,15 +705,170 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
           const chainKeys = [aKey, bKey]
           extendForward(chainKeys)
           extendBackward(chainKeys)
+          if (chainKeys.length >= 2) outlineChains.push(chainKeys)
+        }
 
-          // Convert to Leaflet latlngs.
+        const chainToLatLngs = (chainKeys) => {
           const latLngs = []
           for (const k of chainKeys) {
             const pt = outlinePointByKey.get(k)
             if (!pt) continue
             latLngs.push([pt[1], pt[0]])
           }
-          if (latLngs.length >= 2) countryOutlineLatLngs.push(latLngs)
+          return latLngs
+        }
+
+        const getChainStats = (chainKeys) => {
+          let minLon = Infinity
+          let minLat = Infinity
+          let maxLon = -Infinity
+          let maxLat = -Infinity
+          let seen = 0
+
+          for (const k of chainKeys) {
+            const pt = outlinePointByKey.get(k)
+            if (!pt) continue
+            seen += 1
+            minLon = Math.min(minLon, pt[0])
+            minLat = Math.min(minLat, pt[1])
+            maxLon = Math.max(maxLon, pt[0])
+            maxLat = Math.max(maxLat, pt[1])
+          }
+
+          const isClosed = chainKeys[0] === chainKeys[chainKeys.length - 1]
+          const area = seen > 0 ? Math.max(0, (maxLon - minLon) * (maxLat - minLat)) : 0
+          return { isClosed, area, pointCount: chainKeys.length }
+        }
+
+        let bestChain = null
+        let bestStats = null
+        for (const chainKeys of outlineChains) {
+          const stats = getChainStats(chainKeys)
+          if (!stats.isClosed) continue
+          if (!bestStats) {
+            bestChain = chainKeys
+            bestStats = stats
+            continue
+          }
+          if (stats.area > bestStats.area || (stats.area === bestStats.area && stats.pointCount > bestStats.pointCount)) {
+            bestChain = chainKeys
+            bestStats = stats
+          }
+        }
+
+        let countryOutlineLatLngs = []
+        if (bestChain) {
+          const latLngs = chainToLatLngs(bestChain)
+          if (latLngs.length >= 2) countryOutlineLatLngs = [latLngs]
+        } else {
+          // Fallback: render all stitched unshared-edge polylines.
+          countryOutlineLatLngs = outlineChains.map(chainToLatLngs).filter((latLngs) => latLngs.length >= 2)
+        }
+
+        // Secondary fallback: if for some reason unshared-edge stitching produced nothing, try the legacy
+        // exterior-edge test (more expensive; only run when needed).
+        if (countryOutlineLatLngs.length === 0) {
+          const legacyAdj = new Map()
+          const legacyPointByKey = new Map()
+          const legacyEdgeList = []
+          const legacyEdgeSet = new Set()
+
+          for (const edge of edgeOwners.values()) {
+            if (edge.admins.size !== 1) continue
+            if (!isExteriorEdge(edge)) continue
+            const a = snapPt(edge.a)
+            const b = snapPt(edge.b)
+            const aKey = coordKeyFromSnapped(a)
+            const bKey = coordKeyFromSnapped(b)
+            if (!aKey || !bKey || aKey === bKey) continue
+            const eKey = aKey < bKey ? `${aKey}|${bKey}` : `${bKey}|${aKey}`
+            if (legacyEdgeSet.has(eKey)) continue
+            legacyEdgeSet.add(eKey)
+            legacyEdgeList.push({ aKey, bKey })
+            legacyPointByKey.set(aKey, a)
+            legacyPointByKey.set(bKey, b)
+            getOrCreateSet(legacyAdj, aKey).add(bKey)
+            getOrCreateSet(legacyAdj, bKey).add(aKey)
+          }
+
+          const legacyVisited = new Set()
+          const takeLegacyNext = (curr, prev) => {
+            const neighbors = legacyAdj.get(curr)
+            if (!neighbors || neighbors.size === 0) return null
+            for (const n of neighbors) {
+              if (n === prev) continue
+              const ek = edgeKeyFromKeys(curr, n)
+              if (legacyVisited.has(ek)) continue
+              return n
+            }
+            if (prev) {
+              const ek = edgeKeyFromKeys(curr, prev)
+              if (!legacyVisited.has(ek)) return prev
+            }
+            return null
+          }
+
+          const extendLegacyForward = (chainKeys) => {
+            let guard = 0
+            while (guard < 200000) {
+              guard += 1
+              const n = chainKeys.length
+              if (n < 2) break
+              const prev = chainKeys[n - 2]
+              const curr = chainKeys[n - 1]
+              const next = takeLegacyNext(curr, prev)
+              if (!next) break
+              const ek = edgeKeyFromKeys(curr, next)
+              legacyVisited.add(ek)
+              chainKeys.push(next)
+              if (next === chainKeys[0]) break
+            }
+          }
+
+          const extendLegacyBackward = (chainKeys) => {
+            let guard = 0
+            while (guard < 200000) {
+              guard += 1
+              const n = chainKeys.length
+              if (n < 2) break
+              const curr = chainKeys[0]
+              const next = chainKeys[1]
+              const neighbors = legacyAdj.get(curr)
+              if (!neighbors || neighbors.size === 0) break
+              let prev = null
+              for (const nKey of neighbors) {
+                if (nKey === next) continue
+                const ek = edgeKeyFromKeys(curr, nKey)
+                if (legacyVisited.has(ek)) continue
+                prev = nKey
+                break
+              }
+              if (!prev) break
+              const ek = edgeKeyFromKeys(curr, prev)
+              legacyVisited.add(ek)
+              chainKeys.unshift(prev)
+              if (prev === chainKeys[chainKeys.length - 1]) break
+            }
+          }
+
+          const legacyLatLngsList = []
+          for (const { aKey, bKey } of legacyEdgeList) {
+            const startEk = edgeKeyFromKeys(aKey, bKey)
+            if (legacyVisited.has(startEk)) continue
+            legacyVisited.add(startEk)
+            const chainKeys = [aKey, bKey]
+            extendLegacyForward(chainKeys)
+            extendLegacyBackward(chainKeys)
+            const latLngs = []
+            for (const k of chainKeys) {
+              const pt = legacyPointByKey.get(k)
+              if (!pt) continue
+              latLngs.push([pt[1], pt[0]])
+            }
+            if (latLngs.length >= 2) legacyLatLngsList.push(latLngs)
+          }
+
+          countryOutlineLatLngs = legacyLatLngsList
         }
 
         const labelsLayer = L.layerGroup()
@@ -685,7 +929,8 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
 
         const countryOutlineLayer = L.polyline(countryOutlineLatLngs, {
           ...buildCountryOutlineStyle(),
-          renderer: canvasRenderer
+          renderer: outlineRenderer,
+          pane: outlinePaneName
         })
         countryOutlineLayer.addTo(map)
 
@@ -701,6 +946,7 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
           if (!map.hasLayer(labelsLayer)) labelsLayer.addTo(map)
 
           const muniBounds = new Map()
+          const muniAgg = new Map() // muniCode -> { sumA, sumX, sumY, polygons: [] }
           for (const [adminId, layerItem] of adminRegistryById.entries()) {
             const assigned = adminAssignedMunicipality.get(adminId)
             const original = adminOriginalMunicipality.get(adminId)
@@ -715,18 +961,71 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
             } else {
               muniBounds.set(muniCode, b.clone ? b.clone() : b)
             }
+
+            const geom = adminGeometryIndex.get(adminId)
+            if (!geom) continue
+            if (!muniAgg.has(muniCode)) muniAgg.set(muniCode, { sumA: 0, sumX: 0, sumY: 0, polygons: [] })
+            const agg = muniAgg.get(muniCode)
+            agg.polygons.push({ bbox: geom.bbox, rings: geom.rings })
+            if (geom.areaAbs > 0 && Array.isArray(geom.centroid)) {
+              agg.sumA += geom.areaAbs
+              agg.sumX += geom.centroid[0] * geom.areaAbs
+              agg.sumY += geom.centroid[1] * geom.areaAbs
+            }
           }
 
-          muniBounds.forEach((bounds, muniCode) => {
-            const center = bounds.getCenter()
+          const allMuniCodes = new Set([...muniBounds.keys(), ...muniAgg.keys()])
+          allMuniCodes.forEach((muniCode) => {
+            const bounds = muniBounds.get(muniCode)
+            const agg = muniAgg.get(muniCode)
+            let centerLatLng = null
+
+            if (agg && agg.sumA > 0 && agg.polygons.length > 0) {
+              const centerLonLat = [agg.sumX / agg.sumA, agg.sumY / agg.sumA]
+              if (pointInAnyPolygon(centerLonLat, agg.polygons)) {
+                centerLatLng = [centerLonLat[1], centerLonLat[0]]
+              }
+            }
+
+            if (!centerLatLng && agg && agg.polygons.length > 0) {
+              let bestPoly = null
+              let bestArea = -Infinity
+              for (const poly of agg.polygons) {
+                const a = (poly.bbox[2] - poly.bbox[0]) * (poly.bbox[3] - poly.bbox[1])
+                if (a > bestArea) {
+                  bestArea = a
+                  bestPoly = poly
+                }
+              }
+
+              const candidates = bestPoly ? [bestPoly, ...agg.polygons] : agg.polygons
+              for (const poly of candidates) {
+                const probe = interiorPointForPolygon(poly)
+                if (!probe) continue
+                if (!pointInPolygon(probe, poly)) continue
+                centerLatLng = [probe[1], probe[0]]
+                break
+              }
+            }
+
+            if (!centerLatLng && bounds) {
+              const center = bounds.getCenter()
+              centerLatLng = [center.lat, center.lng]
+            }
+
+            if (!centerLatLng) return
             const label = municipalityNameByCode.get(muniCode) || muniCode
-            const html = `<div class="muni-label-inner">${label}</div>`
+            const fill = getMunicipalityColor(muniCode)
+            const textColor = getReadableTextColor(fill)
+            const borderColor = textColor === '#ffffff' ? 'rgba(255,255,255,0.38)' : 'rgba(15,23,42,0.24)'
+            const textShadow = textColor === '#ffffff' ? '0 1px 2px rgba(0,0,0,0.35)' : 'none'
+            const html = `<div class="muni-label-inner" style="background:${fill};color:${textColor};border-color:${borderColor};text-shadow:${textShadow}">${label}</div>`
             const icon = L.divIcon({
               className: 'muni-label',
               html,
               iconSize: null
             })
-            L.marker(center, { icon, interactive: false, keyboard: false }).addTo(labelsLayer)
+            L.marker(centerLatLng, { icon, interactive: false, keyboard: false }).addTo(labelsLayer)
           })
         }
 
@@ -844,6 +1143,10 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
         :global(.muni-label) {
           background: transparent;
           border: none;
+          width: 0;
+          height: 0;
+          overflow: visible;
+          position: relative;
         }
 
         :global(.muni-label-inner) {
@@ -858,10 +1161,14 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
           box-shadow: 0 10px 22px rgba(0, 0, 0, 0.10);
           white-space: nowrap;
           pointer-events: none;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          text-align: center;
           transform: translate(-50%, -50%);
-          position: relative;
-          left: 50%;
-          top: 50%;
+          position: absolute;
+          left: 0;
+          top: 0;
         }
       `}</style>
     </div>

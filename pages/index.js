@@ -5,7 +5,7 @@ const AlbaniaMap = dynamic(() => import('../components/AlbaniaMap'), { ssr: fals
 
 export default function Home() {
   const [controls, setControls] = useState(null)
-  const [showLabels, setShowLabels] = useState(false)
+  const [showLabels, setShowLabels] = useState(true)
 
   return (
     <div className="app-shell">
