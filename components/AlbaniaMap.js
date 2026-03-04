@@ -283,6 +283,30 @@ function polygonAreaAbsAndCentroid({ bbox, rings } = {}) {
   return { areaAbs: 0, centroid: null }
 }
 
+function roundRectPath(ctx, x, y, w, h, r) {
+  const radius = Math.max(0, Math.min(r, w / 2, h / 2))
+  ctx.beginPath()
+  ctx.moveTo(x + radius, y)
+  ctx.arcTo(x + w, y, x + w, y + h, radius)
+  ctx.arcTo(x + w, y + h, x, y + h, radius)
+  ctx.arcTo(x, y + h, x, y, radius)
+  ctx.arcTo(x, y, x + w, y, radius)
+  ctx.closePath()
+}
+
+function canvasToBlob(canvas, type = 'image/png', quality) {
+  return new Promise((resolve, reject) => {
+    if (!canvas || typeof canvas.toBlob !== 'function') {
+      reject(new Error('Canvas does not support toBlob()'))
+      return
+    }
+    canvas.toBlob((blob) => {
+      if (!blob) reject(new Error('Failed to create screenshot blob'))
+      else resolve(blob)
+    }, type, quality)
+  })
+}
+
 function pointInAnyPolygon(point, polygons) {
   for (const poly of polygons) {
     const { bbox, rings } = poly
@@ -332,6 +356,8 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
   const recomputeBordersRef = useRef(null)
   const updateLabelsRef = useRef(null)
   const clearLabelsRef = useRef(null)
+  const captureScreenshotRef = useRef(null)
+  const labelMetaRef = useRef([])
   const showLabelsRef = useRef(false)
   const [loadError, setLoadError] = useState(null)
   const [loaded, setLoaded] = useState(false)
@@ -368,7 +394,10 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
         map = L.map(mapContainer, {
           preferCanvas: true,
           zoomControl: false,
-          attributionControl: false
+          attributionControl: false,
+          zoomSnap: 0.25,
+          zoomDelta: 0.25,
+          wheelPxPerZoomLevel: 120
         }).setView([41.34, 20.0], 7)
 
         const outlinePaneName = 'country-outline'
@@ -380,7 +409,7 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
         }
 
         const canvasRenderer = L.canvas({ padding: 0.5 })
-        const outlineRenderer = L.svg({ pane: outlinePaneName })
+        const outlineRenderer = L.canvas({ pane: outlinePaneName, padding: 0.5 })
 
         const response = await fetch('/adm_units_munis_with_polygons.geojson')
         if (!response.ok) throw new Error(`GET ${response.status}`)
@@ -939,6 +968,7 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
         const clearLabels = () => {
           labelsLayer.clearLayers()
           if (map.hasLayer(labelsLayer)) map.removeLayer(labelsLayer)
+          labelMetaRef.current = []
         }
 
         const updateLabels = () => {
@@ -947,6 +977,7 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
 
           const muniBounds = new Map()
           const muniAgg = new Map() // muniCode -> { sumA, sumX, sumY, polygons: [] }
+          const nextLabelMeta = []
           for (const [adminId, layerItem] of adminRegistryById.entries()) {
             const assigned = adminAssignedMunicipality.get(adminId)
             const original = adminOriginalMunicipality.get(adminId)
@@ -1026,7 +1057,17 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
               iconSize: null
             })
             L.marker(centerLatLng, { icon, interactive: false, keyboard: false }).addTo(labelsLayer)
+
+            nextLabelMeta.push({
+              centerLatLng,
+              label,
+              fill,
+              textColor,
+              borderColor
+            })
           })
+
+          labelMetaRef.current = nextLabelMeta
         }
 
         clearLabelsRef.current = clearLabels
@@ -1056,10 +1097,175 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
           if (showLabelsRef.current) updateLabels()
         }
 
+        captureScreenshotRef.current = async (options = {}) => {
+          const marginRatio = typeof options.marginRatio === 'number' ? options.marginRatio : 0.1
+          const background = typeof options.background === 'string' ? options.background : '#ffffff'
+
+          if (!map) throw new Error('Map not ready')
+          const container = map.getContainer?.()
+          if (!container) throw new Error('Map container missing')
+
+          const targetBounds = adminLayer?.getBounds?.()
+          if (!targetBounds?.isValid || !targetBounds.isValid()) throw new Error('Map bounds not available')
+
+          const rect = container.getBoundingClientRect()
+          if (!rect || rect.width <= 0 || rect.height <= 0) throw new Error('Map container has zero size')
+
+          const dprRaw = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
+          const dpr = Math.max(1, Math.min(2, dprRaw))
+
+          const baseCanvas = document.createElement('canvas')
+          baseCanvas.width = Math.max(1, Math.round(rect.width * dpr))
+          baseCanvas.height = Math.max(1, Math.round(rect.height * dpr))
+          const ctx = baseCanvas.getContext('2d')
+          if (!ctx) throw new Error('Canvas 2D context unavailable')
+          ctx.scale(dpr, dpr)
+
+          ctx.fillStyle = background
+          ctx.fillRect(0, 0, rect.width, rect.height)
+
+          const canvases = Array.from(container.querySelectorAll('canvas'))
+          for (const canvas of canvases) {
+            const cRect = canvas.getBoundingClientRect()
+            const dx = cRect.left - rect.left
+            const dy = cRect.top - rect.top
+            if (!Number.isFinite(dx) || !Number.isFinite(dy)) continue
+            if (cRect.width <= 0 || cRect.height <= 0) continue
+            ctx.drawImage(canvas, dx, dy, cRect.width, cRect.height)
+          }
+
+          if (showLabelsRef.current && Array.isArray(labelMetaRef.current) && labelMetaRef.current.length > 0) {
+            ctx.save()
+            ctx.font = '800 11px \"Trebuchet MS\", \"Gill Sans\", \"Gill Sans MT\", Calibri, sans-serif'
+            ctx.textBaseline = 'middle'
+            ctx.textAlign = 'center'
+
+            const paddingX = 8
+            const paddingY = 4
+            const radius = 10
+            const lineHeight = 11 * 1.1
+
+            for (const item of labelMetaRef.current) {
+              const centerLatLng = item?.centerLatLng
+              const label = String(item?.label || '').trim()
+              if (!centerLatLng || !label) continue
+
+              const point = map.latLngToContainerPoint(centerLatLng)
+              const x = point?.x
+              const y = point?.y
+              if (!Number.isFinite(x) || !Number.isFinite(y)) continue
+
+              const metrics = ctx.measureText(label)
+              const textWidth = metrics?.width || 0
+              const boxW = textWidth + paddingX * 2
+              const boxH = lineHeight + paddingY * 2
+              const left = x - boxW / 2
+              const top = y - boxH / 2
+
+              ctx.save()
+              ctx.shadowColor = 'rgba(0, 0, 0, 0.10)'
+              ctx.shadowBlur = 22
+              ctx.shadowOffsetX = 0
+              ctx.shadowOffsetY = 10
+              roundRectPath(ctx, left, top, boxW, boxH, radius)
+              ctx.fillStyle = String(item?.fill || '#ffffff')
+              ctx.fill()
+              ctx.restore()
+
+              roundRectPath(ctx, left, top, boxW, boxH, radius)
+              ctx.lineWidth = 1
+              ctx.strokeStyle = String(item?.borderColor || 'rgba(15, 23, 42, 0.24)')
+              ctx.stroke()
+
+              ctx.fillStyle = String(item?.textColor || '#0b1220')
+              ctx.fillText(label, x, y)
+            }
+
+            ctx.restore()
+          }
+
+          const viewBounds = map.getBounds?.()
+          let cropBounds = targetBounds
+
+          if (viewBounds?.isValid?.()) {
+            const vSW = viewBounds.getSouthWest()
+            const vNE = viewBounds.getNorthEast()
+            const tSW = targetBounds.getSouthWest()
+            const tNE = targetBounds.getNorthEast()
+
+            const containsTarget =
+              vSW.lat <= tSW.lat && vSW.lng <= tSW.lng && vNE.lat >= tNE.lat && vNE.lng >= tNE.lng
+
+            if (!containsTarget) {
+              const south = Math.max(vSW.lat, tSW.lat)
+              const west = Math.max(vSW.lng, tSW.lng)
+              const north = Math.min(vNE.lat, tNE.lat)
+              const east = Math.min(vNE.lng, tNE.lng)
+              if (south < north && west < east) {
+                cropBounds = {
+                  getNorthWest: () => ({ lat: north, lng: west }),
+                  getSouthEast: () => ({ lat: south, lng: east })
+                }
+              } else {
+                cropBounds = null
+              }
+            }
+          }
+
+          let cropLeft = 0
+          let cropTop = 0
+          let cropRight = rect.width
+          let cropBottom = rect.height
+
+          if (cropBounds) {
+            const nw = map.latLngToContainerPoint(cropBounds.getNorthWest())
+            const se = map.latLngToContainerPoint(cropBounds.getSouthEast())
+            const minX = Math.max(0, Math.min(nw.x, se.x))
+            const minY = Math.max(0, Math.min(nw.y, se.y))
+            const maxX = Math.min(rect.width, Math.max(nw.x, se.x))
+            const maxY = Math.min(rect.height, Math.max(nw.y, se.y))
+
+            const bboxW = Math.max(1, maxX - minX)
+            const bboxH = Math.max(1, maxY - minY)
+            const padX = Math.max(16, bboxW * marginRatio)
+            const padY = Math.max(16, bboxH * marginRatio)
+
+            cropLeft = Math.max(0, minX - padX)
+            cropTop = Math.max(0, minY - padY)
+            cropRight = Math.min(rect.width, maxX + padX)
+            cropBottom = Math.min(rect.height, maxY + padY)
+          }
+
+          const cropW = Math.max(1, cropRight - cropLeft)
+          const cropH = Math.max(1, cropBottom - cropTop)
+
+          const outCanvas = document.createElement('canvas')
+          outCanvas.width = Math.max(1, Math.round(cropW * dpr))
+          outCanvas.height = Math.max(1, Math.round(cropH * dpr))
+          const octx = outCanvas.getContext('2d')
+          if (!octx) throw new Error('Canvas 2D context unavailable')
+          octx.fillStyle = background
+          octx.fillRect(0, 0, outCanvas.width, outCanvas.height)
+          octx.drawImage(
+            baseCanvas,
+            Math.round(cropLeft * dpr),
+            Math.round(cropTop * dpr),
+            Math.round(cropW * dpr),
+            Math.round(cropH * dpr),
+            0,
+            0,
+            Math.round(cropW * dpr),
+            Math.round(cropH * dpr)
+          )
+
+          return canvasToBlob(outCanvas)
+        }
+
         if (typeof onControls === 'function') {
           onControls({
             reset: () => resetRef.current?.(),
             recomputeBorders: () => recomputeBordersRef.current?.(),
+            captureScreenshot: (options) => captureScreenshotRef.current?.(options),
             loaded: true,
             error: null
           })
@@ -1093,6 +1299,9 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
             onControls({
               reset: () => {},
               recomputeBorders: () => {},
+              captureScreenshot: async () => {
+                throw new Error(message)
+              },
               loaded: true,
               error: message
             })
@@ -1115,6 +1324,8 @@ export default function AlbaniaMap({ onControls, showMunicipalityLabels }) {
       recomputeBordersRef.current = null
       updateLabelsRef.current = null
       clearLabelsRef.current = null
+      captureScreenshotRef.current = null
+      labelMetaRef.current = []
       if (typeof onControls === 'function') onControls(null)
       if (map) map.remove()
     }
